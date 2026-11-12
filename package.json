@@ -1,0 +1,50 @@
+{
+  "name": "vfs-wasi",
+  "version": "0.1.0",
+  "description": "High-performance Two-Tier Virtual File System and WASI Preview 1 filesystem provider for WebAssembly runtimes",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./ssys": "./src/ssys.js",
+    "./shared-sysroot": "./src/shared-sysroot.js",
+    "./vfs": "./src/vfs.js",
+    "./wasi-fs": "./src/wasi-fs.js",
+    "./sync": "./src/sync.js"
+  },
+  "bin": {
+    "vfs-pack": "./bin/vfs-pack.js",
+    "vfs-inspect": "./bin/vfs-inspect.js"
+  },
+  "scripts": {
+    "test": "node test/ssys.test.js && node test/vfs.test.js && node test/wasi-fs.test.js && node test/sync.test.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    "SPEC.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "author": "breeze833",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/breeze833/vfs-wasi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/breeze833/vfs-wasi/issues"
+  },
+  "homepage": "https://github.com/breeze833/vfs-wasi#readme",
+  "keywords": [
+    "wasi",
+    "wasi-fs",
+    "vfs",
+    "webassembly",
+    "wasm",
+    "filesystem",
+    "overlay-fs",
+    "sharedarraybuffer",
+    "sysroot"
+  ]
+}
