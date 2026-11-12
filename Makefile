@@ -11,4 +11,5 @@ clean:
 pack: dist
 
 dist:
-	npm pack
+	mkdir -p dist
+	npm pack --pack-destination dist
