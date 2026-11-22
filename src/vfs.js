@@ -12,6 +12,7 @@ export const EEXIST = 20;
 export const EINVAL = 28;
 export const EBADF = 8;
 export const EPERM = 63;
+export const ENOTEMPTY = 66;
 
 /**
  * Normalizes a virtual path string.
@@ -427,7 +428,7 @@ export class OverlayVFS {
     if (targetNode.isDir && targetNode.children.size > 0 && !recursive) {
       const err = new Error(`ENOTEMPTY: Directory not empty, rmdir '${norm}'`);
       err.code = 'ENOTEMPTY';
-      err.errno = 66;
+      err.errno = ENOTEMPTY;
       throw err;
     }
 
@@ -517,7 +518,7 @@ export class OverlayVFS {
       if (existingDest.isDir && sourceNode.isDir && existingDest.children.size > 0) {
         const err = new Error(`ENOTEMPTY: Directory not empty: ${targetNorm}`);
         err.code = 'ENOTEMPTY';
-        err.errno = 66;
+        err.errno = ENOTEMPTY;
         throw err;
       }
     }

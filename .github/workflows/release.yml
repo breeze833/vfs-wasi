@@ -35,45 +35,47 @@ jobs:
       - name: Package Distribution Archive
         run: make dist
 
-      - name: Reset Rolling Tag 'latest' to Current Tag Commit
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          gh release delete latest --cleanup-tag --yes || true
-          git push origin :refs/tags/latest 2>/dev/null || true
-          git tag -d latest 2>/dev/null || true
-          sleep 2
-          git tag -f latest
-          git push --force origin latest
-
-      - name: Publish Versioned Release (Git Tag)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish Versioned Release (v* Tag)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           name: "vfs-wasi ${{ github.ref_name }}"
           generate_release_notes: true
+          make_latest: "true"
           files: |
             dist/*.tgz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish Rolling Latest Release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Rolling Update 'latest' Git Tag
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f latest "${{ github.sha }}"
+          git push --force origin refs/tags/latest
+
+      - name: Remove Stale Rolling 'latest' Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes || true
+
+      - name: Publish Rolling 'latest' Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          target_commitish: ${{ github.sha }}
-          name: "vfs-wasi latest"
+          name: "Latest (${{ github.ref_name }})"
           body: |
-            Latest release tracking version `${{ github.ref_name }}` (`${{ github.sha }}`).
+            Rolling release pointing to `${{ github.ref_name }}` (`${{ github.sha }}`).
 
             ### 📦 Downloadable Assets:
-            - **`vfs-wasi-${{ github.ref_name }}.tgz`**: Pre-packaged zero-dependency NPM package archive ready for installation and embedding.
-          prerelease: false
-          make_latest: "legacy"
+            - **`vfs-wasi-*.tgz`**: Pre-packaged zero-dependency NPM package archive ready for installation and embedding.
+          make_latest: "false"
           files: |
             dist/*.tgz
         env:

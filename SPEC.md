@@ -1,12 +1,12 @@
-# SPEC.md: Architectural Specification for `vfs-wasi`
+# SPEC.md: Architectural Specification for `vfs-wasi` (`v0.2.0`)
 
 ---
 
 ## 1. Architectural Ground Truth & Mission Statement
 
-`vfs-wasi` provides a zero-dependency, high-performance **Two-Tier Virtual File System (VFS)** and **WASI Preview 1 (`wasi_snapshot_preview1`)** filesystem host provider for WebAssembly runtimes.
+`vfs-wasi` provides a zero-dependency, high-performance **Two-Tier Virtual File System (`OverlayVFS`)**, contiguous **Shared Binary Sysroot (`SharedSysroot` / `SSYS`)**, and **Worker Delta Synchronization (`DeltaTracker`)** layer for WebAssembly runtimes.
 
-Designed specifically for multi-worker browser IDEs (such as [`wasm-c-ide`](https://github.com/breeze833/wasm-c-ide)), WebAssembly workers, Node.js sandboxes, and POSIX toolchains (Clang/LLVM, BusyBox ash, GNU Make, SQLite, Python, Ruby), `vfs-wasi` solves the memory duplication, slow startup, and permission isolation bottlenecks inherent to running complex filesystem-dependent workloads in WebAssembly.
+Designed specifically for multi-worker browser IDEs (such as [`wasm-c-ide`](https://github.com/breeze833/wasm-c-ide)), WebAssembly workers, Node.js sandboxes, and POSIX toolchains (Clang/LLVM, BusyBox ash, GNU Make, SQLite, Python, Ruby), `vfs-wasi` solves the memory duplication, slow startup, and permission isolation bottlenecks inherent to running complex filesystem-dependent workloads in WebAssembly—while cleanly delegating all `wasi_snapshot_preview1` / `wasi_unstable` syscall hosting to [`wasi-host`](https://github.com/breeze833/wasi-host).
 
 ---
 
@@ -18,9 +18,9 @@ When multi-worker concurrency is introduced (such as a Tri-Worker model: `compil
 1. **Redundant Heap Duplication**: Unpacking ~4,000+ files into independent JavaScript object trees per worker consumes ~100 MB of JS heap *per worker* (~300+ MB combined), causing massive heap pressure and aggressive browser garbage collection.
 2. **Boot Latency & Tar Extraction**: Every worker must fetch, decompress, and parse large tarballs on startup, leading to noticeable UI freezes and startup delays.
 3. **Missing Overlay & System Protection**: Standard in-memory filesystems treat all paths equally. If student code, user scripts, or shell utilities modify system paths (`/usr`, `/lib`, `/include`), the underlying runtime image becomes corrupted in memory.
-4. **Lack of Standardized WASI Preview 1 Filesystem Provider**: Existing solutions either tightly couple filesystem syscalls to process lifecycle and non-standard runtimes, or rely on Node.js OS filesystem preopens that cannot run in browser workers.
+4. **Filesystem vs. Syscall Host Coupling**: Embedding a separate WASI syscall table (`createWasiFsImports`) alongside the VFS layer duplicated logic across toolchain and runtime hosts. Starting in `v0.2.0`, WASI syscall translation lives exclusively in [`wasi-host`](https://github.com/breeze833/wasi-host), while `vfs-wasi` remains a pure, zero-dependency VFS storage, sysroot, and synchronization package.
 
-`vfs-wasi` resolves these issues through a memory-mapped, contiguous binary sysroot format (`SSYS`) shared across workers via `SharedArrayBuffer`, combined with an isolated, mutable top-tier overlay and a zero-dependency WASI Preview 1 filesystem host layer.
+`vfs-wasi` resolves these issues through a memory-mapped, contiguous binary sysroot format (`SSYS`) shared across workers via `SharedArrayBuffer`, combined with an isolated, mutable top-tier overlay and a duck-typed contract consumed directly by `wasi-host`.
 
 ---
 
@@ -31,7 +31,7 @@ When multi-worker concurrency is introduced (such as a Tri-Worker model: `compil
   - Modern web browsers (main thread and Web Workers with or without `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`).
   - Node.js (>= 18) with standard ES modules.
   - Headless sandboxes and edge runtimes.
-- **Zero Runtime Dependencies**: The core VFS engine, binary parser, overlay router, and WASI Preview 1 filesystem imports are implemented in 100% pure vanilla JavaScript / TypedArrays with zero external npm dependencies.
+- **Zero Runtime Dependencies**: The entire package (`ssys`, `shared-sysroot`, `vfs`, `sync`, and CLI tools) is implemented in 100% pure vanilla JavaScript / TypedArrays with zero runtime `dependencies` in `package.json`.
 - **Buffer Support**: Dual support for `SharedArrayBuffer` (zero-copy multi-worker concurrency) and standard `ArrayBuffer` (single-threaded or non-isolated fallback).
 - **Encoding Compliance**: Strict compliance with W3C Encoding Standard (`TextDecoder` prohibition on SharedArrayBuffer views).
 
@@ -51,19 +51,14 @@ vfs-wasi/
 │   ├── vfs-pack.js            # CLI tool: compiles directories or tar archives into .ssys images
 │   └── vfs-inspect.js         # CLI tool: inspects and validates .ssys binary headers & index entries
 ├── src/
-│   ├── index.js               # Unified entry point exposing public VFS API & WASI host factory
+│   ├── index.js               # Unified entry point exposing OverlayVFS, SharedSysroot, SSYS, and Sync APIs
 │   ├── ssys.js                # SSYS binary format constants, header definitions, and FNV-1a hasher
 │   ├── shared-sysroot.js      # SharedSysrootBuilder and zero-copy SharedSysrootReader
 │   ├── vfs.js                 # Two-Tier Overlay VFS engine (mutable Map + immutable sysroot)
-│   ├── wasi-fs.js             # Pure WASI Preview 1 filesystem syscall table generator
 │   └── sync.js                # Differential worker synchronization & delta serialization
-├── examples/
-│   ├── basic-node.js          # Running a WASI binary with OverlayVFS in Node.js
-│   └── multi-worker-browser/  # HTML/Worker demo sharing a single SharedSysroot buffer
 └── test/
     ├── ssys.test.js           # Binary format packing, hash lookups, and SAB compatibility
-    ├── vfs.test.js            # Overlay unioning, mtime, permissions, and EROFS tests
-    ├── wasi-fs.test.js        # Standard WASI Preview 1 filesystem syscall conformance
+    ├── vfs.test.js            # Overlay unioning, mtime, permissions, EROFS, and wasi-host contract tests
     └── sync.test.js           # Differential worker delta export and apply tests
 ```
 
@@ -178,70 +173,61 @@ All filesystem methods accept absolute or relative paths and resolve them accord
 
 ### 6.2 Lookup Order & Directory Unioning
 - **File Lookups (`readFile`, `exists`, `stat`, `isDir`)**: Lookups check the top-tier mutable map first. If a local entry exists, it takes precedence (allowing file shadowing or updates). If absent, lookups query the bottom-tier `SharedSysroot`.
-- **Directory Listing (`readDir`, `fd_readdir`)**: Directory enumeration unions children from both tiers:
+- **Directory Listing (`readDir`)**: Directory enumeration unions children from both tiers:
   1. Entries in the mutable top tier are collected.
   2. Entries in the immutable bottom tier under the target directory are merged.
   3. Duplicate entry names are deduplicated.
   4. Results are sorted alphabetically with directories preceding files.
 
 ### 6.3 POSIX Permission & Safety Model (`EROFS`)
-System directories (`/usr`, `/lib`, `/include`, `/bin`, or any custom paths designated as system mounts) are permanently write-protected:
-- `path_open` with write flags (`WASI_O_CREAT`, `WASI_O_TRUNC`, `WASI_FDFLAG_APPEND`, or write capability) returns standard WASI `EROFS` (65).
-- `path_unlink_file`, `path_remove_directory`, and `path_create_directory` return `EROFS` (65).
-- `path_rename` returns `EROFS` if either the source or destination path resides within a system mount.
-- JS API `writeFile` and `mkdir` throw `EROFS: read-only file system` unless invoked with internal option `isSystem = true`.
+System directories (`/usr`, `/lib`, `/include`, `/bin`, `/dev`, or any custom paths designated as system mounts) are permanently write-protected:
+- JS API `writeFile`, `mkdir`, `remove`, `removeFile`, `removeDir`, `rename`, and `setTimes` throw `EROFS` (`errno = 65`) when targeting protected paths (unless `allowReadOnly: true` is passed explicitly for initial sysroot mounting).
+- `_isReadOnly(path)` exposes this read-only guard so [`wasi-host`](https://github.com/breeze833/wasi-host) (`VfsAdapter`) enforces `EROFS` (`65`) across WASI Preview 1 syscalls (`path_open`, `path_create_directory`, `path_unlink_file`, `path_remove_directory`, `path_rename`, `path_filestat_set_times`).
 
 ---
 
-## 7. WASI Preview 1 Filesystem Provider (`wasi-fs`)
+## 7. WASI Host Boundary (`wasi-host` Delegation) & Packaging (`v0.2.0`)
 
-`vfs-wasi` provides a factory `createWasiFsImports(vfs, options)` generating a complete, standalone import object matching `wasi_snapshot_preview1` filesystem specifications.
-
-### 7.1 Preopens & File Descriptor Table
-- `fd 0`: `stdin` (delegated to host stream handler)
-- `fd 1`: `stdout` (delegated to host stream handler)
-- `fd 2`: `stderr` (delegated to host stream handler)
-- `fd 3`: Preopen directory for `/workspace` (or custom user working directory)
-- `fd 4`: Preopen directory for root `/`
-- Dynamic descriptors (`fd >= 5`): Allocated for opened files and directories.
-
-### 7.2 Implemented WASI Preview 1 Syscalls
-
-| Syscall | Signature | Semantics |
-|---|---|---|
-| `fd_prestat_get` | `(fd, prestat_out)` | Returns `__WASI_PREOPENTYPE_DIR` and path length for preopened descriptors. |
-| `fd_prestat_dir_name` | `(fd, path_ptr, path_len)` | Writes the preopen path name into WebAssembly memory. |
-| `fd_fdstat_get` | `(fd, stat_out)` | Returns file type (`FILETYPE_DIRECTORY` / `FILETYPE_REGULAR_FILE`) and full capability rights (`0x1fffffffffffffffn`). |
-| `fd_filestat_get` | `(fd, stat_out)` | Populates size, device, inode, filetype, nlink, atim, mtim, ctim from VFS metadata. |
-| `fd_filestat_set_size` | `(fd, size)` | Truncates or extends an open mutable file to specified byte size. |
-| `fd_read` | `(fd, iovs_ptr, iovs_len, nread_out)` | Reads bytes from current file offset into scatter-gather buffers; advances offset. |
-| `fd_write` | `(fd, iovs_ptr, iovs_len, nwritten_out)` | Writes bytes from gather buffers into mutable VFS file; auto-seeks to EOF if opened with append flag. |
-| `fd_seek` | `(fd, offset, whence, newoffset_out)` | Adjusts file offset (`SEEK_SET = 0`, `SEEK_CUR = 1`, `SEEK_END = 2`). |
-| `fd_tell` | `(fd, offset_out)` | Returns the current file read/write offset. |
-| `fd_close` | `(fd)` | Releases descriptor from the open file table. |
-| `fd_readdir` | `(fd, buf_ptr, buf_len, cookie, bufused_out)` | Packs 24-byte `__wasi_dirent_t` headers followed by file name strings for directory entries, supporting chunked cookie-based pagination. |
-| `path_open` | `(dirfd, dirflags, path_ptr, path_len, oflags, fs_rights_base, fs_rights_inheriting, fdflags, fd_out)` | Resolves path against `dirfd`, validates `EROFS`, creates or truncates file if requested, allocates new descriptor. |
-| `path_filestat_get` | `(dirfd, flags, path_ptr, path_len, stat_out)` | Returns file attributes for path relative to `dirfd`. |
-| `path_filestat_set_times` | `(dirfd, flags, path_ptr, path_len, atim, mtim, fst_flags)` | Updates file modification timestamp (`mtime`), enabling tools like `touch` and `make`. |
-| `path_create_directory` | `(dirfd, path_ptr, path_len)` | Creates a new directory in top-tier mutable storage. |
-| `path_unlink_file` | `(dirfd, path_ptr, path_len)` | Unlinks a regular file from mutable storage; returns `EROFS` for system files. |
-| `path_remove_directory`| `(dirfd, path_ptr, path_len)` | Removes an empty directory from mutable storage. |
-| `path_rename` | `(old_dirfd, old_path_ptr, old_path_len, new_dirfd, new_path_ptr, new_path_len)` | Atomically renames or moves a file or directory within mutable storage. |
-
-### 7.3 Standard WASI Error Codes
+Starting in `v0.2.0`, `vfs-wasi` removes `src/wasi-fs.js` (`createWasiFsImports`) and the `./wasi-fs` subpath export, establishing an acyclic package boundary:
+- **`vfs-wasi` (Storage & Overlay Layer)**: Owns `OverlayVFS`, `SharedSysroot` (`buildSharedSysroot` / `SharedSysrootReader`), `SSYS` primitives, and `DeltaTracker` worker sync with zero runtime dependencies.
+- **`wasi-host` (WASI Preview 1 Execution Layer)**: Owns `wasi_snapshot_preview1` / `wasi_unstable` syscalls, descriptor tables, virtual `/dev/null` and `/dev/zero` devices, preopens, and `VfsAdapter`. Callers pass `new OverlayVFS(...)` directly to `new WasiHost({ vfs })`:
 
 ```javascript
-export const ESUCCESS = 0;
-export const EBADF    = 8;
-export const EEXIST   = 20;
-export const EINVAL   = 28;
-export const EISDIR   = 31;
-export const ENOENT   = 44;
-export const ENOTDIR  = 54;
-export const EPERM    = 63;
-export const EROFS    = 65;
-export const ENOSYS   = 52;
+import { OverlayVFS, buildSharedSysroot } from 'vfs-wasi';
+import { WasiHost } from 'wasi-host';
+
+const vfs = new OverlayVFS({ sharedSysroot, workingDir: '/workspace' });
+const host = new WasiHost({ vfs, cwd: '/workspace' });
 ```
+
+### 7.1 `OverlayVFS` Contract for `wasi-host` (`VfsAdapter`)
+`OverlayVFS` implements the exact capability surface consumed by `wasi-host`'s `VfsAdapter`:
+- `_isReadOnly(path) -> boolean`: Returns `true` for bottom-tier / system paths (`EROFS`).
+- `exists(path) -> boolean`, `isDir(path) -> boolean`, `stat(path) -> { name, isDir, size, mtime, mode } | null`.
+- `readFile(path, asText?) -> Uint8Array | string`, `writeFile(path, content, options?)`, `mkdir(path, options?)`.
+- `removeFile(path)`, `removeDir(path, recursive?)`, `rename(oldPath, newPath)`, `setTimes(path, atim, mtim)`.
+- `readDir(path) -> Array<{ name, isDir, size, mtime, mode }>`.
+
+### 7.2 Standard POSIX / WASI Error Constants (`src/vfs.js`)
+```javascript
+export const EROFS     = 65;
+export const ENOENT    = 44;
+export const EISDIR    = 31;
+export const ENOTDIR   = 54;
+export const EEXIST    = 20;
+export const EINVAL    = 28;
+export const EBADF     = 8;
+export const EPERM     = 63;
+export const ENOTEMPTY = 66;
+```
+
+### 7.3 Package Exports & Release Workflow Policy (`v0.2.0`)
+- **`package.json` Exports**: `.`, `./ssys`, `./shared-sysroot`, `./vfs`, and `./sync` (with zero runtime `dependencies`).
+- **CI & GitHub Releases (`.github/workflows/release.yml`)**:
+  - `npm test` and `make dist` run on `main` pushes, pull requests, and `v*` tag pushes.
+  - GitHub Releases are published **only** on `v*` tag pushes (`startsWith(github.ref, 'refs/tags/v')`):
+    1. Publish the versioned release (`v0.2.0`, etc.) with `make_latest: "true"` and `dist/*.tgz`.
+    2. Update the rolling `latest` git tag (`git tag -f latest HEAD && git push --force origin refs/tags/latest`), remove any stale `latest` release, and republish the rolling `latest` release with `make_latest: "false"` so GitHub's "Latest" badge stays on the versioned release while `/releases/download/latest/...` remains current.
 
 ---
 
@@ -294,8 +280,7 @@ node bin/vfs-inspect.js sysroot.ssys [--tree] [--list] [--path /usr/include/stdi
 
 ## 10. Automated Test & Verification Protocol
 
-The automated test suite (`npm test`) verifies correctness across four dimensions:
+The automated test suite (`npm test`) verifies correctness across three core suites:
 1. **`test/ssys.test.js`**: Validates `SSYS` binary header packing, 32-byte index layout, FNV-1a hashing, zero-copy reading, TextDecoder safety, and fallback to `ArrayBuffer`.
-2. **`test/vfs.test.js`**: Validates two-tier overlay lookups, directory unioning, mutable writes, file removals, `mtime` persistence, and strict `EROFS` enforcement.
-3. **`test/wasi-fs.test.js`**: Validates WASI Preview 1 syscall compliance (`path_open`, `fd_read`, `fd_write`, `fd_seek`, `fd_readdir`, `path_unlink_file`, `path_rename`) with standard memory buffers.
-4. **`test/sync.test.js`**: Validates differential delta export, serialization, and multi-instance synchronization.
+2. **`test/vfs.test.js`**: Validates two-tier overlay lookups, directory unioning, mutable writes, file/directory removals (`ENOTEMPTY`), `rename`, `setTimes` / `mtime` persistence, strict `EROFS` enforcement, and the `OverlayVFS` contract expected by `wasi-host`.
+3. **`test/sync.test.js`**: Validates differential delta export, serialization, and multi-instance synchronization.

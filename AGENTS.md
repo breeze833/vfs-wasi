@@ -6,13 +6,13 @@ This document provides architectural context, design invariants, coding conventi
 
 ## 1. Project Mission & Architecture
 
-`vfs-wasi` is a zero-dependency, high-performance **Two-Tier Virtual File System (VFS)** and **WASI Preview 1 (`wasi_snapshot_preview1`)** filesystem host provider for WebAssembly runtimes.
+`vfs-wasi` is a zero-dependency, high-performance **Two-Tier Virtual File System (`OverlayVFS`)**, **SharedSysroot (`SSYS`)**, and **Worker Delta Synchronization (`DeltaTracker`)** library for WebAssembly runtimes.
 
 Designed specifically for multi-worker browser IDEs (such as [`wasm-c-ide`](https://github.com/breeze833/wasm-c-ide)), WebAssembly workers, Node.js sandboxes, and command-line execution, `vfs-wasi` solves the memory and boot-time bottlenecks of running POSIX toolchains in WebAssembly through:
 1. **Contiguous Binary Sysroot (`SSYS` format)**: Packs large, read-only system trees (C/C++ headers, static `.a` archives, language standard libraries) into a memory-mapped `SharedArrayBuffer` (or standard `ArrayBuffer`).
 2. **Zero-Copy Multi-Worker Sharing**: Multiple Web Workers (`compiler`, `shell`, `runtime`) read directly from a single shared buffer via 32-bit FNV-1a hash index lookups with 0ms initialization time and zero JS heap duplication.
-3. **Two-Tier Overlay Filesystem**: Unifies an immutable bottom tier (`SharedSysroot` for `/usr`, `/lib`, `/include`, `/bin`) with an isolated, mutable top tier (in-memory Map for `/workspace`, `/tmp`), complete with directory unioning (`readDir`, `fd_readdir`), path normalization, and POSIX `EROFS` enforcement.
-4. **Standard WASI Preview 1 Filesystem Provider**: Exposes pure, zero-dependency `wasi_snapshot_preview1` filesystem syscall imports (`path_open`, `fd_read`, `fd_write`, `fd_seek`, `fd_tell`, `fd_close`, `fd_readdir`, `path_unlink_file`, `path_rename`, etc.) ready to be bound to any WASI runtime instance.
+3. **Two-Tier Overlay Filesystem**: Unifies an immutable bottom tier (`SharedSysroot` for `/usr`, `/lib`, `/include`, `/bin`) with an isolated, mutable top tier (in-memory Map for `/workspace`, `/tmp`), complete with directory unioning (`readDir`), path normalization, `mtime` preservation, and POSIX `EROFS` enforcement.
+4. **`wasi-host` Delegation (`v0.2.0`)**: Cleanly delegates all `wasi_snapshot_preview1` / `wasi_unstable` syscalls to [`wasi-host`](https://github.com/breeze833/wasi-host), exposing the exact duck-typed VFS surface consumed by `VfsAdapter` without bundling duplicate WASI syscall tables.
 
 ---
 
@@ -23,17 +23,15 @@ When modifying or extending the codebase, strictly adhere to these fundamental i
 1. **Strict Specification Alignment**:
    - `SPEC.md` is the architectural ground truth. Autonomous agents must strictly adhere to the architecture, binary layout, and WASI host specifications defined in `SPEC.md`. Do not deviate, substitute architectures, or introduce heavyweight dependencies.
 2. **Zero External Runtime Dependencies**:
-   - The core VFS engine (`src/index.js`, `src/vfs.js`, `src/shared-sysroot.js`, `src/wasi-fs.js`) must remain 100% zero-dependency modern JavaScript / WebAssembly.
+   - The core VFS engine (`src/index.js`, `src/ssys.js`, `src/shared-sysroot.js`, `src/vfs.js`, `src/sync.js`) must remain 100% zero-dependency modern JavaScript.
 3. **Dual Buffer Compatibility (SharedArrayBuffer & ArrayBuffer)**:
    - `SharedSysroot` must seamlessly function over `SharedArrayBuffer` (in COOP/COEP cross-origin isolated environments) as well as regular `ArrayBuffer` (in single-thread or non-isolated environments).
 4. **Browser Encoding Standard Compliance**:
    - W3C `TextDecoder.decode()` throws `TypeError` when passed a direct view over a `SharedArrayBuffer`. All string table index parsing and text reading must safely isolate slices into unshared buffers before decoding.
 5. **Strict POSIX Permission & Overlay Isolation**:
-   - System paths (`/usr`, `/lib`, `/include`, `/bin`) are read-only bottom-tier mounts. Write, create, truncate, unlink, or rename operations against bottom-tier paths must strictly return POSIX `EROFS` (errno 65).
-6. **Deterministic WASI Preview 1 ABI Alignment**:
-   - Memory layout of `filestat_t`, `fdstat_t`, `dirent_t`, and cookie-based directory iteration must strictly align with the `wasi_snapshot_preview1` specification.
-7. **Clean Separation between Filesystem and Process/IO Host**:
-   - `vfs-wasi` focuses strictly on the **filesystem domain** (`fd_*`, `path_*`). Process lifecycle (`proc_exit`), system clocks (`clock_time_get`), entropy (`random_get`), and interactive TTY/Atomics stdin are cleanly decoupled.
+   - System paths (`/usr`, `/lib`, `/include`, `/bin`, `/dev`) are read-only bottom-tier mounts. Write, create, truncate, unlink, or rename operations against bottom-tier paths must strictly throw POSIX `EROFS` (errno 65) and report `true` via `_isReadOnly(path)`.
+6. **Clean Boundary with `wasi-host`**:
+   - `vfs-wasi` focuses strictly on **storage, `SSYS` sysroot packing/reading, two-tier overlay resolution, and worker delta sync**. All `wasi_snapshot_preview1` syscalls (`fd_*`, `path_*`, process lifecycle, clocks, entropy, stdio) live in [`wasi-host`](https://github.com/breeze833/wasi-host), which adapts `OverlayVFS` via `VfsAdapter`.
 
 ---
 
@@ -91,19 +89,13 @@ vfs-wasi/
 │   ├── ssys.js                # SSYS constants, header offsets, and FNV-1a path hasher
 │   ├── shared-sysroot.js      # SharedSysrootBuilder and zero-copy SharedSysrootReader
 │   ├── vfs.js                 # Two-Tier Overlay VFS engine (mutable Map + immutable sysroot)
-│   ├── wasi-fs.js             # WASI Preview 1 filesystem syscall imports generator
 │   └── sync.js                # Worker differential synchronization & delta serialization
-├── examples/                  # Reference embeddings and multi-worker demonstrations
-│   ├── basic-node.js          # Running WASI binary with OverlayVFS in Node.js
-│   └── multi-worker-browser/  # HTML/Worker demo sharing a single SharedSysroot
 ├── .github/
 │   └── workflows/
-│       ├── test.yml           # Automated unit test suite on Node.js 18, 20, 22
-│       └── release.yml        # Automated release packaging & publishing
+│       └── release.yml        # Automated CI testing, packaging, and v* GitHub Releases
 └── test/
     ├── ssys.test.js           # Binary format packing, hash collisions, and SAB reading
-    ├── vfs.test.js            # Overlay unioning, mtime, permissions, and EROFS tests
-    ├── wasi-fs.test.js        # Standard WASI Preview 1 filesystem syscall conformance
+    ├── vfs.test.js            # Overlay unioning, mtime, ENOTEMPTY, EROFS, and wasi-host contract tests
     └── sync.test.js           # Differential worker delta export and apply tests
 ```
 
@@ -114,7 +106,7 @@ vfs-wasi/
 ```bash
 # Run automated test suite
 npm test
-# (or: node test/ssys.test.js && node test/vfs.test.js && node test/wasi-fs.test.js && node test/sync.test.js)
+# (or: node test/ssys.test.js && node test/vfs.test.js && node test/sync.test.js)
 
 # Pack a directory into a binary .ssys image
 node bin/vfs-pack.js <directory-or-tar> -o sysroot.ssys

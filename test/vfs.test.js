@@ -7,6 +7,8 @@ import {
   normalizePath,
   buildSharedSysroot,
   EROFS,
+  ENOENT,
+  ENOTEMPTY,
 } from '../src/index.js';
 
 test('OverlayVFS: Path Normalization', () => {
@@ -109,4 +111,50 @@ test('OverlayVFS: Timestamp Management (setTimes)', () => {
 
   const st = vfs.stat('/workspace/test.c');
   assert.equal(st.mtime, customTime);
+
+  const nanoTime = 1700000000000000000n;
+  vfs.setTimes('/workspace/test.c', nanoTime, nanoTime);
+  assert.equal(vfs.stat('/workspace/test.c').mtime, 1700000000000);
+});
+
+test('OverlayVFS: ENOTEMPTY and wasi-host VfsAdapter compatibility contract', () => {
+  const sysrootBuf = buildSharedSysroot([
+    { path: '/usr/include/stdio.h', content: '/* stdio */' },
+  ], { useArrayBuffer: true });
+
+  const vfs = new OverlayVFS({ sharedSysroot: sysrootBuf });
+  vfs.mkdir('/workspace/nonempty', { recursive: true });
+  vfs.writeFile('/workspace/nonempty/item.txt', 'data');
+
+  assert.throws(() => {
+    vfs.removeDir('/workspace/nonempty', false);
+  }, (err) => err.errno === ENOTEMPTY && err.code === 'ENOTEMPTY');
+
+  // Verify duck-typed methods expected by wasi-host VfsAdapter
+  for (const method of [
+    '_isReadOnly',
+    'exists',
+    'isDir',
+    'stat',
+    'readFile',
+    'writeFile',
+    'mkdir',
+    'removeFile',
+    'removeDir',
+    'rename',
+    'setTimes',
+    'readDir',
+  ]) {
+    assert.equal(typeof vfs[method], 'function', `OverlayVFS must expose ${method}()`);
+  }
+
+  assert.equal(vfs._isReadOnly('/usr/include/stdio.h'), true);
+  assert.equal(vfs._isReadOnly('/workspace/nonempty/item.txt'), false);
+
+  vfs.removeDir('/workspace/nonempty', true);
+  assert.equal(vfs.exists('/workspace/nonempty'), false);
+
+  assert.throws(() => {
+    vfs.readFile('/workspace/missing.txt');
+  }, (err) => err.errno === ENOENT);
 });

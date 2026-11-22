@@ -1,8 +1,8 @@
 # vfs-wasi
 
-A zero-dependency, high-performance **Two-Tier Virtual File System (VFS)** and **WASI Preview 1 (`wasi_snapshot_preview1`)** filesystem host provider for WebAssembly runtimes.
+A zero-dependency, high-performance **Two-Tier Virtual File System (`OverlayVFS`)**, contiguous **Shared Binary Sysroot (`SharedSysroot` / `SSYS`)**, and **Worker Delta Synchronization (`DeltaTracker`)** library for WebAssembly runtimes.
 
-Designed specifically for multi-worker browser IDEs (such as [wasm-c-ide](https://github.com/breeze833/wasm-c-ide)), WebAssembly workers, Node.js sandboxes, and POSIX developer toolchains (Clang/LLVM, BusyBox ash, GNU Make, SQLite, Python, Ruby).
+Designed specifically for multi-worker browser IDEs (such as [wasm-c-ide](https://github.com/breeze833/wasm-c-ide)), WebAssembly workers, Node.js sandboxes, and POSIX toolchains (Clang/LLVM, BusyBox ash, GNU Make, SQLite, Python, Ruby)—pairing directly with [`wasi-host`](https://github.com/breeze833/wasi-host) for `wasi_snapshot_preview1` syscall execution.
 
 ---
 
@@ -42,9 +42,9 @@ When multi-worker concurrency is introduced (such as a Tri-Worker model with com
 
 1. **Zero-Copy SharedSysroot (`SSYS`)**: Compiles system directories into a single contiguous, memory-mapped byte buffer stored in a `SharedArrayBuffer` (or standard `ArrayBuffer`).
 2. **Instant Multi-Worker Startup**: Multiple Web Workers query the exact same buffer simultaneously using 32-bit FNV-1a hash index lookups with **0ms startup time and zero memory duplication**.
-3. **Seamless Directory Unioning**: `readDir` and `fd_readdir` automatically union children from both tiers, deduplicating matching names.
-4. **Strict POSIX Permission Enforcement (`EROFS`)**: Intercepts modifications to system mounts at the host level, returning standard WASI `EROFS` (errno 65).
-5. **Zero-Dependency WASI Preview 1 Filesystem Provider**: Exposes standard `wasi_snapshot_preview1` filesystem imports ready to be wired directly into any WASI WebAssembly instance.
+3. **Seamless Directory Unioning**: `readDir` automatically unions children from both tiers, deduplicating matching names.
+4. **Strict POSIX Permission Enforcement (`EROFS`)**: Guards system mounts at the VFS layer (`EROFS`, errno 65) and exposes `_isReadOnly(path)` for WASI hosts.
+5. **Clean `wasi-host` Integration**: Composes directly with [`wasi-host`](https://github.com/breeze833/wasi-host) (`new WasiHost({ vfs })`), keeping VFS storage and binary sysroot tooling 100% dependency-free.
 
 ---
 
@@ -53,12 +53,9 @@ When multi-worker concurrency is introduced (such as a Tri-Worker model with com
 - **Pure Zero-Dependency Architecture**: 100% vanilla JavaScript / TypedArrays; zero external runtime dependencies.
 - **Dual Buffer Support**: Operates over `SharedArrayBuffer` (in COOP/COEP isolated environments) or regular `ArrayBuffer` (in single-thread or non-isolated environments).
 - **W3C TextDecoder Compliant**: Fully compliant with the W3C Encoding Standard prohibition on shared buffer views.
-- **Complete WASI Preview 1 Syscall Coverage**:
-  - `path_open`, `fd_read`, `fd_write`, `fd_seek`, `fd_tell`, `fd_close`
-  - `fd_filestat_get`, `fd_filestat_set_size`, `fd_fdstat_get`
-  - `fd_readdir` (with 24-byte `__wasi_dirent_t` headers and cookie-based pagination)
-  - `path_unlink_file`, `path_remove_directory`, `path_create_directory`, `path_rename`
-  - `path_filestat_get`, `path_filestat_set_times` (preserves `mtime` for tools like `touch` and `make`)
+- **Two-Tier Overlay & `wasi-host` Compatibility**:
+  - Top-tier mutable storage (`writeFile`, `mkdir`, `removeFile`, `removeDir`, `rename`, `setTimes`) with `mtime` persistence and POSIX error semantics (`EROFS`, `ENOENT`, `EISDIR`, `ENOTDIR`, `EEXIST`, `ENOTEMPTY`).
+  - Bottom-tier immutable `SharedSysroot` (`SSYS`) lookup and sorted directory unioning (`readDir`).
 - **Differential Worker Synchronization**: Built-in delta tracking (`exportDelta`, `applyDelta`) for fast state propagation across worker boundaries.
 - **CLI Utilities Included**:
   - `vfs-pack`: Pack directories or tarballs into `.ssys` images.
@@ -71,7 +68,7 @@ When multi-worker concurrency is introduced (such as a Tri-Worker model with com
 ### 1. In Node.js / Single-Threaded Environments
 
 ```javascript
-import { OverlayVFS, buildSharedSysroot, createWasiFsImports } from 'vfs-wasi';
+import { OverlayVFS, buildSharedSysroot } from 'vfs-wasi';
 
 // 1. Pack system files into a contiguous binary sysroot
 const sysrootBuffer = buildSharedSysroot([
@@ -115,26 +112,27 @@ compilerWorker.postMessage({ type: 'init', sysroot: sharedBuffer });
 shellWorker.postMessage({ type: 'init', sysroot: sharedBuffer });
 runtimeWorker.postMessage({ type: 'init', sysroot: sharedBuffer });
 
-// In worker.js (e.g. compiler.worker.js or shell.worker.js):
-import { OverlayVFS, createWasiFsImports } from 'vfs-wasi';
+// In worker.js (e.g. compiler.worker.js or runtime.worker.js):
+import { OverlayVFS } from 'vfs-wasi';
+import { WasiHost } from 'wasi-host';
 
 self.onmessage = async (e) => {
   if (e.data.type === 'init') {
     const vfs = new OverlayVFS({ sharedSysroot: e.data.sysroot });
-    
-    // Bind directly to WebAssembly WASI instance:
-    const fsImports = createWasiFsImports(vfs, {
-      preopens: { '/workspace': 3, '/': 4 }
+
+    let memory = null;
+    const host = new WasiHost({
+      vfs,
+      cwd: '/workspace',
+      preopens: [
+        { fd: 3, path: '/workspace', name: '.' },
+        { fd: 4, path: '/', name: '/' },
+      ],
+      getMemory: () => memory,
     });
 
-    const wasiImports = {
-      wasi_snapshot_preview1: {
-        ...hostProcessImports, // clocks, random, exit
-        ...fsImports           // all filesystem operations
-      }
-    };
-
-    const { instance } = await WebAssembly.instantiate(wasmModule, wasiImports);
+    const { instance } = await WebAssembly.instantiate(wasmModule, host.createImportObject());
+    memory = instance.exports.memory;
     instance.exports._start();
   }
 };

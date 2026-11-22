@@ -1,4 +1,4 @@
-// vfs-wasi: Two-Tier Virtual File System & WASI Preview 1 Filesystem Provider
+// vfs-wasi: Two-Tier Virtual File System, SharedSysroot, and Delta Sync
 // Main Unified Package Exports
 
 export {
@@ -27,38 +27,8 @@ export {
   EINVAL,
   EBADF,
   EPERM,
-} from './vfs.js';
-
-export {
-  createWasiFsImports,
-  ESUCCESS,
-  ENOSYS,
   ENOTEMPTY,
-  FILETYPE_UNKNOWN,
-  FILETYPE_BLOCK_DEVICE,
-  FILETYPE_CHARACTER_DEVICE,
-  FILETYPE_DIRECTORY,
-  FILETYPE_REGULAR_FILE,
-  FILETYPE_SOCKET_DGRAM,
-  FILETYPE_SOCKET_STREAM,
-  FILETYPE_SYMBOLIC_LINK,
-  PREOPENTYPE_DIR,
-  O_CREAT,
-  O_DIRECTORY,
-  O_EXCL,
-  O_TRUNC,
-  FDFLAG_APPEND,
-  FDFLAG_DSYNC,
-  FDFLAG_NONBLOCK,
-  FDFLAG_RSYNC,
-  FDFLAG_SYNC,
-  WHENCE_SET,
-  WHENCE_CUR,
-  WHENCE_END,
-  RIGHTS_ALL,
-  RIGHTS_READ,
-  RIGHTS_WRITE,
-} from './wasi-fs.js';
+} from './vfs.js';
 
 export {
   DeltaTracker,
